@@ -1,3 +1,4 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 import asyncio
@@ -12,10 +13,10 @@ from telegram.ext import (
 from pymongo import MongoClient
 
 # ===== CONFIG =====
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-OWNER_ID = 123456789
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 CHAT_ID = -1003732357781
-MONGO_URL = "YOUR_MONGODB_URL"
+MONGO_URL = os.getenv("MONGO_URL")
 URL = "https://animexin.dev/"
 
 client = MongoClient(MONGO_URL)
