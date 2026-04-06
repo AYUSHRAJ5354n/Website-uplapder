@@ -4,17 +4,16 @@ import asyncio
 import re
 from datetime import datetime
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telegram.error import RetryAfter
 from pymongo import MongoClient
+from bson import ObjectId
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,7 +33,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        self.wfile.write(b"OK")
 
 def run_server():
     port = int(os.getenv("PORT", 8000))
@@ -120,7 +119,7 @@ async def send_post(app, post):
             break
 
         except RetryAfter as e:
-            print(f"⏳ Flood wait: {e.retry_after}s")
+            print(f"⏳ Flood wait {e.retry_after}s")
             await asyncio.sleep(e.retry_after)
 
         except Exception as e:
@@ -147,8 +146,8 @@ async def auto_update(app):
         await asyncio.sleep(300)
 
 # ===== COMMANDS =====
-def is_owner(user_id):
-    return user_id == OWNER_ID
+def is_owner(uid):
+    return uid == OWNER_ID
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -174,6 +173,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = " ".join(context.args).lower()
+
     results = list(collection.find({"name": {"$regex": query}}))
 
     if not results:
@@ -182,10 +182,14 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = sorted(results, key=lambda x: x["episode"])
 
-    buttons = [
-        [InlineKeyboardButton(f"Ep {r['episode']}", callback_data=r["link"])]
-        for r in results[:50]
-    ]
+    buttons = []
+    for r in results[:50]:
+        buttons.append([
+            InlineKeyboardButton(
+                f"Ep {r['episode']}",
+                callback_data=str(r["_id"])
+            )
+        ])
 
     await update.message.reply_text(
         f"🔍 Found {len(results)} episodes",
@@ -197,15 +201,69 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    link = query.data
-    post = collection.find_one({"link": link})
+    post_id = query.data
+
+    post = collection.find_one({"_id": ObjectId(post_id)})
 
     if post:
         await send_post(context.application, post)
 
+# ===== REUPLOAD =====
+async def reupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    today = datetime.now().strftime("%d/%m/%y")
+
+    posts = list(collection.find({"date": today}))
+
+    for post in posts:
+        await send_post(context.application, post)
+        await asyncio.sleep(2)
+
+    await update.message.reply_text("🔁 Reuploaded today's posts")
+
+# ===== CHK =====
+async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Use: /chk 07/04/26")
+        return
+
+    date = context.args[0]
+
+    posts = list(collection.find({"date": date}))
+
+    if not posts:
+        await update.message.reply_text("❌ No posts found")
+        return
+
+    for post in posts:
+        await send_post(context.application, post)
+        await asyncio.sleep(2)
+
+    await update.message.reply_text(f"📅 Uploaded posts for {date}")
+
+# ===== STATS =====
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    total_posts = collection.count_documents({})
+    total_series = len(collection.distinct("name"))
+
+    await update.message.reply_text(
+        f"""📊 Bot Stats
+
+📦 Total Posts: {total_posts}
+🎬 Total Series: {total_series}
+"""
+    )
+
 # ===== MAIN =====
 def main():
-    # Start health server
     threading.Thread(target=run_server, daemon=True).start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -213,14 +271,15 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(CommandHandler("search", search))
+    app.add_handler(CommandHandler("reupload", reupload))
+    app.add_handler(CommandHandler("chk", chk))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Background loop
-    app.job_queue.run_repeating(
-        lambda ctx: asyncio.create_task(auto_update(app)),
-        interval=300,
-        first=10
-    )
+    async def on_startup(app):
+        asyncio.create_task(auto_update(app))
+
+    app.post_init = on_startup
 
     print("🔥 Bot Running...")
     app.run_polling()
