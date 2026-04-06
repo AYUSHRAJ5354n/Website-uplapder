@@ -34,7 +34,7 @@ def run_server():
     server = HTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
 
-# ===== EPISODE EXTRACTOR =====
+# ===== EPISODE EXTRACT =====
 def extract_episode(title):
     match = re.search(r'episode\s*(\d+)', title.lower())
     return int(match.group(1)) if match else None
@@ -56,13 +56,22 @@ def format_caption(title):
 @Donghua_Xin
 """
 
-# ===== IMAGE =====
+# ===== IMAGE FIX =====
 def get_image(url):
     try:
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
+
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            return og["content"]
+
         img = soup.find("img")
-        return img["src"] if img else None
+        if img and img.get("src"):
+            return img["src"]
+
+        return None
     except:
         return None
 
@@ -70,7 +79,7 @@ def get_image(url):
 async def send_post(app, post, chat_id):
     caption = format_caption(post["title"])
     if not caption:
-        return  # ❌ skip invalid
+        return
 
     if not post.get("image"):
         post["image"] = get_image(post["link"])
@@ -102,7 +111,7 @@ def scrape():
             title = p.find(["h2","h3"]).text.strip()
 
             if not extract_episode(title):
-                continue  # 🔥 STRICT FILTER
+                continue
 
             link = p.find("a")["href"]
 
@@ -264,36 +273,33 @@ async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             collection.insert_one(post)
             count += 1
 
-    await update.message.reply_text(f"✅ Uploaded {count} new episodes")
+    await update.message.reply_text(f"🚀 Uploaded {count} new episodes")
 
 async def reupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    posts = list(collection.find().sort("_id", -1).limit(20))
+    posts = scrape()
     count = 0
 
     for post in posts:
-        if not extract_episode(post["title"]):
-            continue
-
         await send_post(context.application, post, CHAT_ID)
         await asyncio.sleep(2)
         count += 1
 
-    await update.message.reply_text(f"🔁 Reuploaded {count} episodes")
+    await update.message.reply_text(f"🔁 Reuploaded {count} latest episodes")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = collection.count_documents({})
-    await update.message.reply_text(f"📊 Total valid posts: {total}")
+    await update.message.reply_text(f"📊 Total stored episodes: {total}")
 
-# ===== 🔥 EMERGENCY CLEAN =====
+# ===== FULL CLEAN =====
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
 
-    result = collection.delete_many({
-        "title": {"$not": {"$regex": r"Episode\s*\d+", "$options": "i"}}
-    })
+    deleted = collection.delete_many({}).deleted_count
 
-    await update.message.reply_text(f"🧹 Cleaned {result.deleted_count} invalid posts")
+    await update.message.reply_text(
+        f"💀 FULL RESET DONE\n\nDeleted: {deleted}"
+    )
 
 # ===== MAIN =====
 def main():
@@ -306,7 +312,7 @@ def main():
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(CommandHandler("reupload", reupload))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("cleandb", clean_db))
+    app.add_handler(CommandHandler("clean", clean_db))
 
     app.add_handler(CallbackQueryHandler(send_target, pattern="^(dm_|ch_)"))
     app.add_handler(CallbackQueryHandler(button_handler))
