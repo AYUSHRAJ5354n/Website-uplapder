@@ -1,27 +1,46 @@
-import os
 import requests
 from bs4 import BeautifulSoup
 import asyncio
 import re
 from datetime import datetime
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 )
+from telegram.error import RetryAfter
 from pymongo import MongoClient
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-CHAT_ID = -1003732357781
+CHAT_ID = int(os.getenv("CHAT_ID"))
 MONGO_URL = os.getenv("MONGO_URL")
+
 URL = "https://animexin.dev/"
 
+# ===== DB =====
 client = MongoClient(MONGO_URL)
 db = client["donghua_bot"]
 collection = db["posts"]
+
+# ===== HEALTH SERVER =====
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    port = int(os.getenv("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"🌐 Health server running on {port}")
+    server.serve_forever()
 
 # ===== FORMAT =====
 def format_caption(title):
@@ -90,29 +109,40 @@ async def send_post(app, post):
 
     caption = format_caption(post["title"])
 
-    try:
-        await app.bot.send_photo(
-            chat_id=CHAT_ID,
-            photo=post["image"],
-            caption=caption,
-            reply_markup=keyboard
-        )
-    except:
-        await app.bot.send_message(
-            chat_id=CHAT_ID,
-            text=caption,
-            reply_markup=keyboard
-        )
+    while True:
+        try:
+            await app.bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=post["image"],
+                caption=caption,
+                reply_markup=keyboard
+            )
+            break
+
+        except RetryAfter as e:
+            print(f"⏳ Flood wait: {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+
+        except Exception as e:
+            print("Send error:", e)
+            break
 
 # ===== AUTO LOOP =====
 async def auto_update(app):
-    while True:
-        posts = scrape()
+    await asyncio.sleep(10)
 
-        for post in posts:
-            if not collection.find_one({"link": post["link"]}):
-                await send_post(app, post)
-                collection.insert_one(post)
+    while True:
+        try:
+            posts = scrape()
+
+            for post in posts:
+                if not collection.find_one({"link": post["link"]}):
+                    await send_post(app, post)
+                    collection.insert_one(post)
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            print("Loop error:", e)
 
         await asyncio.sleep(300)
 
@@ -138,39 +168,31 @@ async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Updated")
 
-# ===== SEARCH SYSTEM =====
+# ===== SEARCH =====
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
 
     query = " ".join(context.args).lower()
-
     results = list(collection.find({"name": {"$regex": query}}))
 
     if not results:
         await update.message.reply_text("❌ Not found")
         return
 
-    # Sort by episode
     results = sorted(results, key=lambda x: x["episode"])
 
-    buttons = []
-    for r in results:
-        buttons.append([
-            InlineKeyboardButton(
-                f"Ep {r['episode']}",
-                callback_data=r["link"]
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(buttons[:50])  # limit
+    buttons = [
+        [InlineKeyboardButton(f"Ep {r['episode']}", callback_data=r["link"])]
+        for r in results[:50]
+    ]
 
     await update.message.reply_text(
         f"🔍 Found {len(results)} episodes",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-# ===== BUTTON CLICK =====
+# ===== BUTTON =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -182,7 +204,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post(context.application, post)
 
 # ===== MAIN =====
-async def main():
+def main():
+    # Start health server
+    threading.Thread(target=run_server, daemon=True).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -190,10 +215,15 @@ async def main():
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    asyncio.create_task(auto_update(app))
+    # Background loop
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.create_task(auto_update(app)),
+        interval=300,
+        first=10
+    )
 
     print("🔥 Bot Running...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
