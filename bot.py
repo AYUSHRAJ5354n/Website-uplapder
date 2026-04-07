@@ -9,7 +9,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from pymongo import MongoClient
-from bson import ObjectId
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,12 +33,14 @@ def run_server():
     server = HTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
 
-# ===== EPISODE EXTRACT =====
+# ===== HELPERS =====
 def extract_episode(title):
     match = re.search(r'episode\s*(\d+)', title.lower())
     return int(match.group(1)) if match else None
 
-# ===== FORMAT =====
+def extract_series(title):
+    return re.sub(r'episode.*', '', title, flags=re.IGNORECASE).strip().lower()
+
 def format_caption(title):
     ep = extract_episode(title)
     if not ep:
@@ -56,24 +57,69 @@ def format_caption(title):
 @Donghua_Xin
 """
 
-# ===== IMAGE FIX =====
 def get_image(url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
 
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
             return og["content"]
 
-        img = soup.find("img")
-        if img and img.get("src"):
-            return img["src"]
-
         return None
     except:
         return None
+
+# ===== 🔥 FINAL SCRAPER (LATEST RELEASE ONLY) =====
+def scrape():
+    url = "https://animexin.dev/"
+    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    data = []
+
+    # Find Latest Release section
+    section = soup.find("h2", string=lambda x: x and "Latest Release" in x)
+    if not section:
+        return []
+
+    parent = section.find_parent()
+
+    # ONLY visible cards (NOT view all)
+    cards = parent.find_all("article")
+
+    for card in cards[:10]:  # limit to top 10
+        try:
+            a = card.find("a", href=True)
+            if not a:
+                continue
+
+            link = a["href"]
+
+            if "page" in link or "category" in link:
+                continue
+
+            title = card.get_text(" ", strip=True)
+
+            ep = extract_episode(title)
+            if not ep:
+                continue  # skip invalid posts
+
+            img = card.find("img")
+            image = img["src"] if img else None
+
+            data.append({
+                "title": title,
+                "link": link,
+                "image": image,
+                "episode": ep,
+                "series": extract_series(title)
+            })
+
+        except:
+            continue
+
+    return data
 
 # ===== SEND =====
 async def send_post(app, post, chat_id):
@@ -98,37 +144,6 @@ async def send_post(app, post, chat_id):
     except:
         await app.bot.send_message(chat_id=chat_id, text=caption)
 
-# ===== SCRAPER =====
-def scrape():
-    res = requests.get("https://animexin.dev/", headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    posts = soup.find_all("article")
-    data = []
-
-    for p in posts:
-        try:
-            title = p.find(["h2","h3"]).text.strip()
-
-            if not extract_episode(title):
-                continue
-
-            link = p.find("a")["href"]
-
-            img = p.find("img")
-            image = img.get("src") if img else None
-
-            data.append({
-                "title": title,
-                "link": link,
-                "image": image
-            })
-
-        except:
-            continue
-
-    return data
-
 # ===== AUTO UPDATE =====
 async def auto_update(app):
     await asyncio.sleep(10)
@@ -137,144 +152,56 @@ async def auto_update(app):
         posts = scrape()
 
         for post in posts:
-            if not collection.find_one({"link": post["link"]}):
-                await send_post(app, post, CHAT_ID)
-                collection.insert_one(post)
-                await asyncio.sleep(5)
+            series = post["series"]
+            ep = post["episode"]
+
+            last = collection.find_one(
+                {"series": series},
+                sort=[("episode", -1)]
+            )
+
+            if last and ep <= last["episode"]:
+                continue  # skip old
+
+            await send_post(app, post, CHAT_ID)
+
+            collection.insert_one(post)
+
+            await asyncio.sleep(3)
 
         await asyncio.sleep(300)
-
-# ===== GET EPS =====
-def get_eps(url):
-    res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    links = soup.find_all("a", href=True)
-    eps = []
-
-    for a in links:
-        href = a["href"]
-        title = a.text.strip()
-
-        if "episode" not in href:
-            continue
-
-        if not extract_episode(title):
-            continue
-
-        eps.append({"title": title, "link": href})
-
-    unique = {e["link"]: e for e in eps}.values()
-
-    return sorted(unique, key=lambda x: extract_episode(x["title"]))
-
-# ===== SEARCH =====
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-
-    query = " ".join(context.args)
-    slug = query.lower().replace(" ", "-")
-
-    seasons = []
-
-    for i in range(1, 7):
-        url = f"https://animexin.dev/{slug}/" if i == 1 else f"https://animexin.dev/{slug}-season-{i}/"
-
-        try:
-            res = requests.get(url)
-            if res.status_code == 200:
-                seasons.append((f"Season {i}", url))
-        except:
-            continue
-
-    if not seasons:
-        await update.message.reply_text("❌ Not found")
-        return
-
-    if len(seasons) > 1:
-        buttons = []
-        for name, url in seasons:
-            doc = collection.insert_one({"season": True, "url": url, "temp": True})
-            buttons.append([InlineKeyboardButton(name, callback_data=str(doc.inserted_id))])
-
-        await update.message.reply_text("📺 Seasons", reply_markup=InlineKeyboardMarkup(buttons))
-
-    else:
-        eps = get_eps(seasons[0][1])
-
-        buttons = []
-        for ep in eps[:50]:
-            doc = collection.insert_one({"title": ep["title"], "link": ep["link"], "temp": True})
-            num = extract_episode(ep["title"])
-            buttons.append([InlineKeyboardButton(f"Ep {num}", callback_data=str(doc.inserted_id))])
-
-        await update.message.reply_text("📺 Episodes", reply_markup=InlineKeyboardMarkup(buttons))
-
-# ===== CALLBACK =====
-async def send_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    mode, post_id = query.data.split("_")
-    post = collection.find_one({"_id": ObjectId(post_id)})
-
-    if not post:
-        await query.message.reply_text("❌ Expired")
-        return
-
-    if mode == "dm":
-        await send_post(context.application, post, query.from_user.id)
-    else:
-        await send_post(context.application, post, CHAT_ID)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = collection.find_one({"_id": ObjectId(query.data)})
-
-    if not data:
-        await query.message.reply_text("❌ Expired")
-        return
-
-    if data.get("season"):
-        eps = get_eps(data["url"])
-
-        buttons = []
-        for ep in eps[:50]:
-            doc = collection.insert_one({"title": ep["title"], "link": ep["link"], "temp": True})
-            num = extract_episode(ep["title"])
-            buttons.append([InlineKeyboardButton(f"Ep {num}", callback_data=str(doc.inserted_id))])
-
-        await query.message.reply_text("📺 Episodes", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    buttons = [[
-        InlineKeyboardButton("📩 DM", callback_data=f"dm_{data['_id']}"),
-        InlineKeyboardButton("📢 Channel", callback_data=f"ch_{data['_id']}")
-    ]]
-
-    await query.message.reply_text("📤 Send where?", reply_markup=InlineKeyboardMarkup(buttons))
 
 # ===== COMMANDS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("❌ Private bot")
-    await update.message.reply_text("🔥 Bot Ready")
 
+    await update.message.reply_text("🔥 RSS Donghua Bot Ready")
+
+# ===== UPDATE =====
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     posts = scrape()
     count = 0
 
     for post in posts:
-        if not collection.find_one({"link": post["link"]}):
-            await send_post(context.application, post, CHAT_ID)
-            collection.insert_one(post)
-            count += 1
+        series = post["series"]
+        ep = post["episode"]
+
+        last = collection.find_one(
+            {"series": series},
+            sort=[("episode", -1)]
+        )
+
+        if last and ep <= last["episode"]:
+            continue
+
+        await send_post(context.application, post, CHAT_ID)
+        collection.insert_one(post)
+        count += 1
 
     await update.message.reply_text(f"🚀 Uploaded {count} new episodes")
 
+# ===== REUPLOAD (ONLY HOMEPAGE CURRENT) =====
 async def reupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     posts = scrape()
     count = 0
@@ -284,21 +211,19 @@ async def reupload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         count += 1
 
-    await update.message.reply_text(f"🔁 Reuploaded {count} latest episodes")
+    await update.message.reply_text(f"🔁 Reuploaded {count} latest homepage episodes")
 
+# ===== STATS =====
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = collection.count_documents({})
     await update.message.reply_text(f"📊 Total stored episodes: {total}")
 
-# ===== FULL CLEAN =====
+# ===== CLEAN =====
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-
     deleted = collection.delete_many({}).deleted_count
 
     await update.message.reply_text(
-        f"💀 FULL RESET DONE\n\nDeleted: {deleted}"
+        f"💀 FULL RESET DONE\nDeleted: {deleted}"
     )
 
 # ===== MAIN =====
@@ -308,14 +233,10 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(CommandHandler("reupload", reupload))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("clean", clean_db))
-
-    app.add_handler(CallbackQueryHandler(send_target, pattern="^(dm_|ch_)"))
-    app.add_handler(CallbackQueryHandler(button_handler))
 
     async def startup(app):
         asyncio.create_task(auto_update(app))
